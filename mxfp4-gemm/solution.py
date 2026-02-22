@@ -12,23 +12,21 @@ P = lambda *a: print(*a, file=sys.stderr)
 HIP_SOURCE = r"""
 #include <hip/hip_runtime.h>
 #include <hip/hip_bf16.h>
-#include <math.h>
 
-// Naive: unpack FP4 nibbles, apply E8M0 scales, scalar MAC.
-// One thread per output element. Correct but very slow.
-#define BLOCK_DIM 16
+using fp4x2_t = unsigned char;
+using fp4x64_reg_t = fp4x2_t __attribute__((ext_vector_type(32)));
+using fp32x16_t = float __attribute__((ext_vector_type(16)));
 
-__device__ float decode_fp4_e2m1(unsigned char nib) {
-    // E2M1: sign(1) | exp(2) | mantissa(1)
-    int sign = (nib >> 3) & 1;
-    int exp  = (nib >> 1) & 3;
-    int mant = nib & 1;
-    if (exp == 0 && mant == 0) return 0.0f;
-    float val = (1.0f + mant * 0.5f) * exp2f((float)(exp - 1));
-    return sign ? -val : val;
-}
+#define WARP_SIZE 64
+#define TILE_M 32
+#define TILE_N 32
+#define TILE_K 64
 
-__global__ void mxfp4_gemm_naive(
+// First attempt at using mfma_scale_f32_32x32x64_f8f6f4.
+// Register layout is probably wrong — output is incorrect but want to
+// see if the instruction compiles and runs before fixing the mapping.
+__global__ __launch_bounds__(WARP_SIZE)
+void mxfp4_gemm_mfma_v1(
     const unsigned char* __restrict__ A_q,
     const unsigned char* __restrict__ B_q,
     const unsigned char* __restrict__ A_scale,
@@ -36,27 +34,48 @@ __global__ void mxfp4_gemm_naive(
     __hip_bfloat16* __restrict__ C,
     int M, int N, int K
 ) {
-    int m = blockIdx.x * BLOCK_DIM + threadIdx.x;
-    int n = blockIdx.y * BLOCK_DIM + threadIdx.y;
-    if (m >= M || n >= N) return;
+    int lane_id = threadIdx.x;
+    int m_base = blockIdx.x * TILE_M;
+    int n_base = blockIdx.y * TILE_N;
 
+    fp32x16_t acc = {};
     int K_packed = K >> 1;
     int K_sg = K >> 5;
-    float acc = 0.0f;
 
-    for (int k = 0; k < K; k++) {
-        unsigned char byte_a = A_q[m * K_packed + (k >> 1)];
-        unsigned char byte_b = B_q[n * K_packed + (k >> 1)];
-        unsigned char nib_a = (k & 1) ? (byte_a >> 4) : (byte_a & 0xF);
-        unsigned char nib_b = (k & 1) ? (byte_b >> 4) : (byte_b & 0xF);
+    for (int k = 0; k < K; k += TILE_K) {
+        fp4x64_reg_t a_reg = {};
+        fp4x64_reg_t b_reg = {};
 
-        float sa = exp2f((float)A_scale[m * K_sg + (k >> 5)] - 127.0f);
-        float sb = exp2f((float)B_scale[n * K_sg + (k >> 5)] - 127.0f);
+        // Naive packing: lane i loads row i of the tile
+        // This doesn't match the expected mfma lane layout but lets us test the instruction
+        int a_row = m_base + (lane_id % TILE_M);
+        if (a_row < M) {
+            int off = a_row * K_packed + (k >> 1);
+            for (int i = 0; i < 32; i++)
+                a_reg[i] = (off + i < (a_row+1) * K_packed) ? A_q[off + i] : 0;
+        }
 
-        acc += decode_fp4_e2m1(nib_a) * sa * decode_fp4_e2m1(nib_b) * sb;
+        int b_row = n_base + (lane_id % TILE_N);
+        if (b_row < N) {
+            int off = b_row * K_packed + (k >> 1);
+            for (int i = 0; i < 32; i++)
+                b_reg[i] = (off + i < (b_row+1) * K_packed) ? B_q[off + i] : 0;
+        }
+
+        unsigned char sa = (a_row < M) ? A_scale[a_row * K_sg + k/32] : 127;
+        unsigned char sb = (b_row < N) ? B_scale[b_row * K_sg + k/32] : 127;
+
+        acc = __builtin_amdgcn_mfma_scale_f32_32x32x64_f8f6f4(
+            a_reg, b_reg, acc, 4, 4, 0, sa, 0, sb);
     }
 
-    C[m * N + n] = __float2bfloat16(acc);
+    // Output mapping is also wrong here — just dumping for debugging
+    int out_row = m_base + (lane_id / 2);
+    int out_col = n_base + (lane_id % 2) * 16;
+    if (out_row < M) {
+        for (int i = 0; i < 16 && out_col + i < N; i++)
+            C[out_row * N + out_col + i] = __float2bfloat16(acc[i]);
+    }
 }
 
 #include <torch/extension.h>
@@ -66,11 +85,10 @@ torch::Tensor mxfp4_gemm(
     torch::Tensor A_scale, torch::Tensor B_scale,
     int M, int N, int K
 ) {
-    auto C = torch::empty({M, N},
+    auto C = torch::zeros({M, N},
         torch::TensorOptions().dtype(torch::kBFloat16).device(A_q.device()));
-    dim3 block(BLOCK_DIM, BLOCK_DIM);
-    dim3 grid((M + BLOCK_DIM-1)/BLOCK_DIM, (N + BLOCK_DIM-1)/BLOCK_DIM);
-    mxfp4_gemm_naive<<<grid, block>>>(
+    dim3 grid((M + TILE_M-1)/TILE_M, (N + TILE_N-1)/TILE_N);
+    mxfp4_gemm_mfma_v1<<<grid, WARP_SIZE>>>(
         A_q.data_ptr<uint8_t>(), B_q.data_ptr<uint8_t>(),
         A_scale.data_ptr<uint8_t>(), B_scale.data_ptr<uint8_t>(),
         reinterpret_cast<__hip_bfloat16*>(C.data_ptr()), M, N, K);
@@ -90,16 +108,16 @@ _hip_mod = None
 try:
     from torch.utils.cpp_extension import load_inline
     _hip_mod = load_inline(
-        name="mxfp4_gemm_naive",
+        name="mxfp4_gemm_mfma_v1",
         cpp_sources=HIP_DECL,
         cuda_sources=HIP_SOURCE,
         functions=["mxfp4_gemm"],
         extra_cuda_cflags=["-O2", "-std=c++17", "--offload-arch=gfx950"],
         verbose=False,
     )
-    P("[naive] compiled ok")
+    P("[mfma_v1] compiled ok")
 except Exception as e:
-    P(f"[naive] compilation failed: {e}")
+    P(f"[mfma_v1] compilation failed: {e}")
 
 _aiter_quant = None
 
@@ -133,7 +151,7 @@ def custom_kernel(data: input_t) -> output_t:
                 sc.contiguous(), b_scale_raw.view(torch.uint8).contiguous(),
                 m, n, k)
         except Exception as e:
-            P(f"[naive] error: {e}")
+            P(f"[mfma_v1] error: {e}")
 
     from aiter.ops.triton.gemm.basic.gemm_afp4wfp4 import gemm_afp4wfp4
     return gemm_afp4wfp4(fp4, B_q.view(torch.uint8), sc, b_scale_raw, dtype=torch.bfloat16)
