@@ -21,12 +21,14 @@ using fp32x16_t = float __attribute__((ext_vector_type(16)));
 #define TILE_M 32
 #define TILE_N 32
 #define TILE_K 64
+#define TILE_K_BYTES 32
+#define SCALE_GROUP 32
 
-// First attempt at using mfma_scale_f32_32x32x64_f8f6f4.
-// Register layout is probably wrong — output is incorrect but want to
-// see if the instruction compiles and runs before fixing the mapping.
+// Fixed register packing and output lane layout.
+// Each lane owns one row of A and one col of B for its warp tile.
+// Reads directly from global memory, no LDS yet.
 __global__ __launch_bounds__(WARP_SIZE)
-void mxfp4_gemm_mfma_v1(
+void mxfp4_gemm_mfma_gmem(
     const unsigned char* __restrict__ A_q,
     const unsigned char* __restrict__ B_q,
     const unsigned char* __restrict__ A_scale,
@@ -37,44 +39,49 @@ void mxfp4_gemm_mfma_v1(
     int lane_id = threadIdx.x;
     int m_base = blockIdx.x * TILE_M;
     int n_base = blockIdx.y * TILE_N;
-
-    fp32x16_t acc = {};
     int K_packed = K >> 1;
     int K_sg = K >> 5;
+
+    fp32x16_t acc = {};
+
+    // Each lane handles one row of the 32x32 tile
+    int a_row = m_base + (lane_id % TILE_M);
+    int b_row = n_base + (lane_id % TILE_N);
 
     for (int k = 0; k < K; k += TILE_K) {
         fp4x64_reg_t a_reg = {};
         fp4x64_reg_t b_reg = {};
 
-        // Naive packing: lane i loads row i of the tile
-        // This doesn't match the expected mfma lane layout but lets us test the instruction
-        int a_row = m_base + (lane_id % TILE_M);
+        // Pack A: lane holds TILE_K_BYTES bytes starting at (a_row, k/2)
         if (a_row < M) {
             int off = a_row * K_packed + (k >> 1);
-            for (int i = 0; i < 32; i++)
-                a_reg[i] = (off + i < (a_row+1) * K_packed) ? A_q[off + i] : 0;
+            for (int i = 0; i < TILE_K_BYTES; i++)
+                a_reg[i] = (k/2 + i < K_packed) ? A_q[off + i] : 0;
         }
 
-        int b_row = n_base + (lane_id % TILE_N);
         if (b_row < N) {
             int off = b_row * K_packed + (k >> 1);
-            for (int i = 0; i < 32; i++)
-                b_reg[i] = (off + i < (b_row+1) * K_packed) ? B_q[off + i] : 0;
+            for (int i = 0; i < TILE_K_BYTES; i++)
+                b_reg[i] = (k/2 + i < K_packed) ? B_q[off + i] : 0;
         }
 
-        unsigned char sa = (a_row < M) ? A_scale[a_row * K_sg + k/32] : 127;
-        unsigned char sb = (b_row < N) ? B_scale[b_row * K_sg + k/32] : 127;
+        int sg = k / SCALE_GROUP;
+        unsigned char sa = (a_row < M && sg < K_sg) ? A_scale[a_row * K_sg + sg] : 127;
+        unsigned char sb = (b_row < N && sg < K_sg) ? B_scale[b_row * K_sg + sg] : 127;
 
         acc = __builtin_amdgcn_mfma_scale_f32_32x32x64_f8f6f4(
             a_reg, b_reg, acc, 4, 4, 0, sa, 0, sb);
     }
 
-    // Output mapping is also wrong here — just dumping for debugging
-    int out_row = m_base + (lane_id / 2);
-    int out_col = n_base + (lane_id % 2) * 16;
-    if (out_row < M) {
-        for (int i = 0; i < 16 && out_col + i < N; i++)
-            C[out_row * N + out_col + i] = __float2bfloat16(acc[i]);
+    // Output: 32x32 tile, each lane holds 16 values
+    // Lane layout: lane_id / 32 selects group-of-4-rows, lane_id % 32 selects column
+    int out_col = n_base + (lane_id % 32);
+    if (out_col < N) {
+        for (int i = 0; i < 16; i++) {
+            int out_row = m_base + (lane_id / 32) * 4 + (i % 4) + (i / 4) * 8;
+            if (out_row < M)
+                C[out_row * N + out_col] = __float2bfloat16(acc[i]);
+        }
     }
 }
 
@@ -85,10 +92,10 @@ torch::Tensor mxfp4_gemm(
     torch::Tensor A_scale, torch::Tensor B_scale,
     int M, int N, int K
 ) {
-    auto C = torch::zeros({M, N},
+    auto C = torch::empty({M, N},
         torch::TensorOptions().dtype(torch::kBFloat16).device(A_q.device()));
     dim3 grid((M + TILE_M-1)/TILE_M, (N + TILE_N-1)/TILE_N);
-    mxfp4_gemm_mfma_v1<<<grid, WARP_SIZE>>>(
+    mxfp4_gemm_mfma_gmem<<<grid, WARP_SIZE>>>(
         A_q.data_ptr<uint8_t>(), B_q.data_ptr<uint8_t>(),
         A_scale.data_ptr<uint8_t>(), B_scale.data_ptr<uint8_t>(),
         reinterpret_cast<__hip_bfloat16*>(C.data_ptr()), M, N, K);
@@ -108,16 +115,16 @@ _hip_mod = None
 try:
     from torch.utils.cpp_extension import load_inline
     _hip_mod = load_inline(
-        name="mxfp4_gemm_mfma_v1",
+        name="mxfp4_gemm_mfma_gmem",
         cpp_sources=HIP_DECL,
         cuda_sources=HIP_SOURCE,
         functions=["mxfp4_gemm"],
         extra_cuda_cflags=["-O2", "-std=c++17", "--offload-arch=gfx950"],
         verbose=False,
     )
-    P("[mfma_v1] compiled ok")
+    P("[mfma_gmem] compiled ok")
 except Exception as e:
-    P(f"[mfma_v1] compilation failed: {e}")
+    P(f"[mfma_gmem] compilation failed: {e}")
 
 _aiter_quant = None
 
@@ -151,7 +158,7 @@ def custom_kernel(data: input_t) -> output_t:
                 sc.contiguous(), b_scale_raw.view(torch.uint8).contiguous(),
                 m, n, k)
         except Exception as e:
-            P(f"[mfma_v1] error: {e}")
+            P(f"[mfma_gmem] error: {e}")
 
     from aiter.ops.triton.gemm.basic.gemm_afp4wfp4 import gemm_afp4wfp4
     return gemm_afp4wfp4(fp4, B_q.view(torch.uint8), sc, b_scale_raw, dtype=torch.bfloat16)
