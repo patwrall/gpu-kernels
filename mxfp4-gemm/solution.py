@@ -17,18 +17,21 @@ using fp4x2_t = unsigned char;
 using fp4x64_reg_t = fp4x2_t __attribute__((ext_vector_type(32)));
 using fp32x16_t = float __attribute__((ext_vector_type(16)));
 
-#define WARP_SIZE 64
 #define TILE_M 32
 #define TILE_N 32
 #define TILE_K 64
 #define TILE_K_BYTES 32
+#define WARP_SIZE 64
 #define SCALE_GROUP 32
+#define BLOCK_M 64
+#define BLOCK_N 64
+#define NUM_WARPS 4
+#define BLOCK_THREADS (NUM_WARPS * WARP_SIZE)
 
-// Fixed register packing and output lane layout.
-// Each lane owns one row of A and one col of B for its warp tile.
-// Reads directly from global memory, no LDS yet.
-__global__ __launch_bounds__(WARP_SIZE)
-void mxfp4_gemm_mfma_gmem(
+// Added LDS tiling for A and B. Single buffer, __syncthreads between
+// load and compute. Each warp computes a 32x32 output tile.
+__global__ __launch_bounds__(BLOCK_THREADS)
+void mxfp4_gemm_lds(
     const unsigned char* __restrict__ A_q,
     const unsigned char* __restrict__ B_q,
     const unsigned char* __restrict__ A_scale,
@@ -36,49 +39,71 @@ void mxfp4_gemm_mfma_gmem(
     __hip_bfloat16* __restrict__ C,
     int M, int N, int K
 ) {
-    int lane_id = threadIdx.x;
-    int m_base = blockIdx.x * TILE_M;
-    int n_base = blockIdx.y * TILE_N;
+    int m_start = blockIdx.x * BLOCK_M;
+    int n_start = blockIdx.y * BLOCK_N;
+    int tid = threadIdx.x;
+    int warp_id = tid / WARP_SIZE;
+    int lane_id = tid % WARP_SIZE;
+    int warp_m = warp_id >> 1;
+    int warp_n = warp_id & 1;
+    int tile_m = m_start + warp_m * TILE_M;
+    int tile_n = n_start + warp_n * TILE_N;
+
+    fp32x16_t acc = {};
     int K_packed = K >> 1;
     int K_sg = K >> 5;
 
-    fp32x16_t acc = {};
+    __shared__ unsigned char smem_a[BLOCK_M * TILE_K_BYTES];
+    __shared__ unsigned char smem_b[BLOCK_N * TILE_K_BYTES];
 
-    // Each lane handles one row of the 32x32 tile
-    int a_row = m_base + (lane_id % TILE_M);
-    int b_row = n_base + (lane_id % TILE_N);
+    for (int k_tile = 0; k_tile < K; k_tile += TILE_K) {
+        int k_byte = k_tile >> 1;
 
-    for (int k = 0; k < K; k += TILE_K) {
+        // Cooperatively fill LDS
+        int elems = BLOCK_M * TILE_K_BYTES;
+        for (int off = tid; off < elems; off += BLOCK_THREADS) {
+            int row = off / TILE_K_BYTES;
+            int col = off % TILE_K_BYTES;
+            int grow = m_start + row;
+            smem_a[off] = (grow < M && k_byte + col < K_packed)
+                ? A_q[grow * K_packed + k_byte + col] : 0;
+        }
+        for (int off = tid; off < elems; off += BLOCK_THREADS) {
+            int row = off / TILE_K_BYTES;
+            int col = off % TILE_K_BYTES;
+            int grow = n_start + row;
+            smem_b[off] = (grow < N && k_byte + col < K_packed)
+                ? B_q[grow * K_packed + k_byte + col] : 0;
+        }
+        __syncthreads();
+
         fp4x64_reg_t a_reg = {};
         fp4x64_reg_t b_reg = {};
 
-        // Pack A: lane holds TILE_K_BYTES bytes starting at (a_row, k/2)
-        if (a_row < M) {
-            int off = a_row * K_packed + (k >> 1);
-            for (int i = 0; i < TILE_K_BYTES; i++)
-                a_reg[i] = (k/2 + i < K_packed) ? A_q[off + i] : 0;
+        int a_base = warp_m * TILE_M * TILE_K_BYTES;
+        int b_base = warp_n * TILE_N * TILE_K_BYTES;
+
+        for (int i = 0; i < TILE_K_BYTES; i++) {
+            a_reg[i] = smem_a[a_base + (lane_id % TILE_M) * TILE_K_BYTES + i];
+            b_reg[i] = smem_b[b_base + (lane_id % TILE_N) * TILE_K_BYTES + i];
         }
 
-        if (b_row < N) {
-            int off = b_row * K_packed + (k >> 1);
-            for (int i = 0; i < TILE_K_BYTES; i++)
-                b_reg[i] = (k/2 + i < K_packed) ? B_q[off + i] : 0;
-        }
-
-        int sg = k / SCALE_GROUP;
-        unsigned char sa = (a_row < M && sg < K_sg) ? A_scale[a_row * K_sg + sg] : 127;
-        unsigned char sb = (b_row < N && sg < K_sg) ? B_scale[b_row * K_sg + sg] : 127;
+        int sk = k_tile / SCALE_GROUP;
+        int a_row = tile_m + (lane_id % TILE_M);
+        int b_row = tile_n + (lane_id % TILE_N);
+        unsigned char sa = (a_row < M && sk < K_sg) ? A_scale[a_row * K_sg + sk] : 127;
+        unsigned char sb = (b_row < N && sk < K_sg) ? B_scale[b_row * K_sg + sk] : 127;
 
         acc = __builtin_amdgcn_mfma_scale_f32_32x32x64_f8f6f4(
             a_reg, b_reg, acc, 4, 4, 0, sa, 0, sb);
+
+        __syncthreads();
     }
 
-    // Output: 32x32 tile, each lane holds 16 values
-    // Lane layout: lane_id / 32 selects group-of-4-rows, lane_id % 32 selects column
-    int out_col = n_base + (lane_id % 32);
+    int out_col = tile_n + (lane_id % 32);
     if (out_col < N) {
         for (int i = 0; i < 16; i++) {
-            int out_row = m_base + (lane_id / 32) * 4 + (i % 4) + (i / 4) * 8;
+            int out_row = tile_m + (lane_id / 32) * 4 + (i % 4) + (i / 4) * 8;
             if (out_row < M)
                 C[out_row * N + out_col] = __float2bfloat16(acc[i]);
         }
@@ -94,8 +119,8 @@ torch::Tensor mxfp4_gemm(
 ) {
     auto C = torch::empty({M, N},
         torch::TensorOptions().dtype(torch::kBFloat16).device(A_q.device()));
-    dim3 grid((M + TILE_M-1)/TILE_M, (N + TILE_N-1)/TILE_N);
-    mxfp4_gemm_mfma_gmem<<<grid, WARP_SIZE>>>(
+    dim3 grid((M + BLOCK_M-1)/BLOCK_M, (N + BLOCK_N-1)/BLOCK_N);
+    mxfp4_gemm_lds<<<grid, BLOCK_THREADS>>>(
         A_q.data_ptr<uint8_t>(), B_q.data_ptr<uint8_t>(),
         A_scale.data_ptr<uint8_t>(), B_scale.data_ptr<uint8_t>(),
         reinterpret_cast<__hip_bfloat16*>(C.data_ptr()), M, N, K);
@@ -115,16 +140,16 @@ _hip_mod = None
 try:
     from torch.utils.cpp_extension import load_inline
     _hip_mod = load_inline(
-        name="mxfp4_gemm_mfma_gmem",
+        name="mxfp4_gemm_lds",
         cpp_sources=HIP_DECL,
         cuda_sources=HIP_SOURCE,
         functions=["mxfp4_gemm"],
-        extra_cuda_cflags=["-O2", "-std=c++17", "--offload-arch=gfx950"],
+        extra_cuda_cflags=["-O3", "-std=c++17", "--offload-arch=gfx950"],
         verbose=False,
     )
-    P("[mfma_gmem] compiled ok")
+    P("[lds] compiled ok")
 except Exception as e:
-    P(f"[mfma_gmem] compilation failed: {e}")
+    P(f"[lds] compilation failed: {e}")
 
 _aiter_quant = None
 
@@ -158,7 +183,7 @@ def custom_kernel(data: input_t) -> output_t:
                 sc.contiguous(), b_scale_raw.view(torch.uint8).contiguous(),
                 m, n, k)
         except Exception as e:
-            P(f"[mfma_gmem] error: {e}")
+            P(f"[lds] error: {e}")
 
     from aiter.ops.triton.gemm.basic.gemm_afp4wfp4 import gemm_afp4wfp4
     return gemm_afp4wfp4(fp4, B_q.view(torch.uint8), sc, b_scale_raw, dtype=torch.bfloat16)
