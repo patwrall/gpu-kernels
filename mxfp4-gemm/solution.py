@@ -1,5 +1,11 @@
 #!POPCORN leaderboard amd-mxfp4-mm
 #!POPCORN gpu MI355X
+"""GEMM v463: profiling showed __syncthreads dominates at small M.
+
+M=16, K=7168: 224 K-iterations with a sync each = bottleneck.
+Doubled TILE_K from 32 to 64 FP4 elements (32 bytes), halving sync count.
+Still 72us vs Triton 20us but closer.
+"""
 import os, sys
 os.environ["HIP_FORCE_DEV_KERNARG"] = "1"
 os.environ.setdefault("PYTORCH_ROCM_ARCH", "gfx950")
@@ -28,10 +34,8 @@ using fp32x16_t = float __attribute__((ext_vector_type(16)));
 #define NUM_WARPS 4
 #define BLOCK_THREADS (NUM_WARPS * WARP_SIZE)
 
-// Added LDS tiling for A and B. Single buffer, __syncthreads between
-// load and compute. Each warp computes a 32x32 output tile.
 __global__ __launch_bounds__(BLOCK_THREADS)
-void mxfp4_gemm_lds(
+void mxfp4_gemm_lds_v2(
     const unsigned char* __restrict__ A_q,
     const unsigned char* __restrict__ B_q,
     const unsigned char* __restrict__ A_scale,
@@ -58,9 +62,8 @@ void mxfp4_gemm_lds(
 
     for (int k_tile = 0; k_tile < K; k_tile += TILE_K) {
         int k_byte = k_tile >> 1;
-
-        // Cooperatively fill LDS
         int elems = BLOCK_M * TILE_K_BYTES;
+
         for (int off = tid; off < elems; off += BLOCK_THREADS) {
             int row = off / TILE_K_BYTES;
             int col = off % TILE_K_BYTES;
@@ -81,18 +84,18 @@ void mxfp4_gemm_lds(
         fp4x64_reg_t b_reg = {};
 
         int a_base = warp_m * TILE_M * TILE_K_BYTES;
-        int b_base = warp_n * TILE_N * TILE_K_BYTES;
-
+        int a_off  = (lane_id % 32) * TILE_K_BYTES + (lane_id / 32) * 16;
         for (int i = 0; i < TILE_K_BYTES; i++) {
-            a_reg[i] = smem_a[a_base + (lane_id % TILE_M) * TILE_K_BYTES + i];
-            b_reg[i] = smem_b[b_base + (lane_id % TILE_N) * TILE_K_BYTES + i];
+            a_reg[i] = smem_a[a_base + a_off + i];
+            b_reg[i] = smem_b[warp_n * TILE_N * TILE_K_BYTES + a_off + i];
         }
 
         int sk = k_tile / SCALE_GROUP;
-        int a_row = tile_m + (lane_id % TILE_M);
-        int b_row = tile_n + (lane_id % TILE_N);
-        unsigned char sa = (a_row < M && sk < K_sg) ? A_scale[a_row * K_sg + sk] : 127;
-        unsigned char sb = (b_row < N && sk < K_sg) ? B_scale[b_row * K_sg + sk] : 127;
+        int a_row = tile_m + (lane_id % 32);
+        int b_row = tile_n + (lane_id % 32);
+        int a_sg  = lane_id / 32;
+        unsigned char sa = (a_row < M && sk + a_sg < K_sg) ? A_scale[a_row * K_sg + sk + a_sg] : 127;
+        unsigned char sb = (b_row < N && sk + a_sg < K_sg) ? B_scale[b_row * K_sg + sk + a_sg] : 127;
 
         acc = __builtin_amdgcn_mfma_scale_f32_32x32x64_f8f6f4(
             a_reg, b_reg, acc, 4, 4, 0, sa, 0, sb);
@@ -120,7 +123,7 @@ torch::Tensor mxfp4_gemm(
     auto C = torch::empty({M, N},
         torch::TensorOptions().dtype(torch::kBFloat16).device(A_q.device()));
     dim3 grid((M + BLOCK_M-1)/BLOCK_M, (N + BLOCK_N-1)/BLOCK_N);
-    mxfp4_gemm_lds<<<grid, BLOCK_THREADS>>>(
+    mxfp4_gemm_lds_v2<<<grid, BLOCK_THREADS>>>(
         A_q.data_ptr<uint8_t>(), B_q.data_ptr<uint8_t>(),
         A_scale.data_ptr<uint8_t>(), B_scale.data_ptr<uint8_t>(),
         reinterpret_cast<__hip_bfloat16*>(C.data_ptr()), M, N, K);
@@ -140,16 +143,16 @@ _hip_mod = None
 try:
     from torch.utils.cpp_extension import load_inline
     _hip_mod = load_inline(
-        name="mxfp4_gemm_lds",
+        name="mxfp4_gemm_lds_v2",
         cpp_sources=HIP_DECL,
         cuda_sources=HIP_SOURCE,
         functions=["mxfp4_gemm"],
         extra_cuda_cflags=["-O3", "-std=c++17", "--offload-arch=gfx950"],
         verbose=False,
     )
-    P("[lds] compiled ok")
+    P("[lds_v2] compiled ok")
 except Exception as e:
-    P(f"[lds] compilation failed: {e}")
+    P(f"[lds_v2] compilation failed: {e}")
 
 _aiter_quant = None
 
@@ -183,7 +186,7 @@ def custom_kernel(data: input_t) -> output_t:
                 sc.contiguous(), b_scale_raw.view(torch.uint8).contiguous(),
                 m, n, k)
         except Exception as e:
-            P(f"[lds] error: {e}")
+            P(f"[lds_v2] error: {e}")
 
     from aiter.ops.triton.gemm.basic.gemm_afp4wfp4 import gemm_afp4wfp4
     return gemm_afp4wfp4(fp4, B_q.view(torch.uint8), sc, b_scale_raw, dtype=torch.bfloat16)
