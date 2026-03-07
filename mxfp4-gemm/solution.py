@@ -1,11 +1,5 @@
 #!POPCORN leaderboard amd-mxfp4-mm
 #!POPCORN gpu MI355X
-"""GEMM v463: profiling showed __syncthreads dominates at small M.
-
-M=16, K=7168: 224 K-iterations with a sync each = bottleneck.
-Doubled TILE_K from 32 to 64 FP4 elements (32 bytes), halving sync count.
-Still 72us vs Triton 20us but closer.
-"""
 import os, sys
 os.environ["HIP_FORCE_DEV_KERNARG"] = "1"
 os.environ.setdefault("PYTORCH_ROCM_ARCH", "gfx950")
@@ -35,7 +29,7 @@ using fp32x16_t = float __attribute__((ext_vector_type(16)));
 #define BLOCK_THREADS (NUM_WARPS * WARP_SIZE)
 
 __global__ __launch_bounds__(BLOCK_THREADS)
-void mxfp4_gemm_lds_v2(
+void mxfp4_gemm_vec_lds(
     const unsigned char* __restrict__ A_q,
     const unsigned char* __restrict__ B_q,
     const unsigned char* __restrict__ A_scale,
@@ -62,21 +56,38 @@ void mxfp4_gemm_lds_v2(
 
     for (int k_tile = 0; k_tile < K; k_tile += TILE_K) {
         int k_byte = k_tile >> 1;
-        int elems = BLOCK_M * TILE_K_BYTES;
+        int elems = BLOCK_M * TILE_K_BYTES; // 2048
 
-        for (int off = tid; off < elems; off += BLOCK_THREADS) {
+        // 128-bit vectorized loads: 8 bytes per thread instead of 1
+        for (int off = tid * 8; off < elems; off += BLOCK_THREADS * 8) {
             int row = off / TILE_K_BYTES;
             int col = off % TILE_K_BYTES;
             int grow = m_start + row;
-            smem_a[off] = (grow < M && k_byte + col < K_packed)
-                ? A_q[grow * K_packed + k_byte + col] : 0;
+            if (grow < M && k_byte + col + 7 < K_packed) {
+                *reinterpret_cast<uint64_t*>(&smem_a[off]) =
+                    *reinterpret_cast<const uint64_t*>(&A_q[grow * K_packed + k_byte + col]);
+            } else {
+                for (int b = 0; b < 8 && off + b < elems; b++) {
+                    int r2 = (off+b)/TILE_K_BYTES, c2 = (off+b)%TILE_K_BYTES;
+                    int gr = m_start + r2;
+                    smem_a[off+b] = (gr < M && k_byte+c2 < K_packed) ? A_q[gr*K_packed+k_byte+c2] : 0;
+                }
+            }
         }
-        for (int off = tid; off < elems; off += BLOCK_THREADS) {
+        for (int off = tid * 8; off < elems; off += BLOCK_THREADS * 8) {
             int row = off / TILE_K_BYTES;
             int col = off % TILE_K_BYTES;
             int grow = n_start + row;
-            smem_b[off] = (grow < N && k_byte + col < K_packed)
-                ? B_q[grow * K_packed + k_byte + col] : 0;
+            if (grow < N && k_byte + col + 7 < K_packed) {
+                *reinterpret_cast<uint64_t*>(&smem_b[off]) =
+                    *reinterpret_cast<const uint64_t*>(&B_q[grow * K_packed + k_byte + col]);
+            } else {
+                for (int b = 0; b < 8 && off + b < elems; b++) {
+                    int r2 = (off+b)/TILE_K_BYTES, c2 = (off+b)%TILE_K_BYTES;
+                    int gr = n_start + r2;
+                    smem_b[off+b] = (gr < N && k_byte+c2 < K_packed) ? B_q[gr*K_packed+k_byte+c2] : 0;
+                }
+            }
         }
         __syncthreads();
 
@@ -85,10 +96,13 @@ void mxfp4_gemm_lds_v2(
 
         int a_base = warp_m * TILE_M * TILE_K_BYTES;
         int a_off  = (lane_id % 32) * TILE_K_BYTES + (lane_id / 32) * 16;
-        for (int i = 0; i < TILE_K_BYTES; i++) {
-            a_reg[i] = smem_a[a_base + a_off + i];
-            b_reg[i] = smem_b[warp_n * TILE_N * TILE_K_BYTES + a_off + i];
-        }
+        *reinterpret_cast<uint64_t*>(&a_reg[0]) = *reinterpret_cast<uint64_t*>(&smem_a[a_base + a_off]);
+        *reinterpret_cast<uint64_t*>(&a_reg[8]) = *reinterpret_cast<uint64_t*>(&smem_a[a_base + a_off + 8]);
+
+        int b_base = warp_n * TILE_N * TILE_K_BYTES;
+        int b_off  = (lane_id % 32) * TILE_K_BYTES + (lane_id / 32) * 16;
+        *reinterpret_cast<uint64_t*>(&b_reg[0]) = *reinterpret_cast<uint64_t*>(&smem_b[b_base + b_off]);
+        *reinterpret_cast<uint64_t*>(&b_reg[8]) = *reinterpret_cast<uint64_t*>(&smem_b[b_base + b_off + 8]);
 
         int sk = k_tile / SCALE_GROUP;
         int a_row = tile_m + (lane_id % 32);
@@ -123,7 +137,7 @@ torch::Tensor mxfp4_gemm(
     auto C = torch::empty({M, N},
         torch::TensorOptions().dtype(torch::kBFloat16).device(A_q.device()));
     dim3 grid((M + BLOCK_M-1)/BLOCK_M, (N + BLOCK_N-1)/BLOCK_N);
-    mxfp4_gemm_lds_v2<<<grid, BLOCK_THREADS>>>(
+    mxfp4_gemm_vec_lds<<<grid, BLOCK_THREADS>>>(
         A_q.data_ptr<uint8_t>(), B_q.data_ptr<uint8_t>(),
         A_scale.data_ptr<uint8_t>(), B_scale.data_ptr<uint8_t>(),
         reinterpret_cast<__hip_bfloat16*>(C.data_ptr()), M, N, K);
@@ -143,16 +157,16 @@ _hip_mod = None
 try:
     from torch.utils.cpp_extension import load_inline
     _hip_mod = load_inline(
-        name="mxfp4_gemm_lds_v2",
+        name="mxfp4_gemm_vec_lds",
         cpp_sources=HIP_DECL,
         cuda_sources=HIP_SOURCE,
         functions=["mxfp4_gemm"],
         extra_cuda_cflags=["-O3", "-std=c++17", "--offload-arch=gfx950"],
         verbose=False,
     )
-    P("[lds_v2] compiled ok")
+    P("[vec_lds] compiled ok")
 except Exception as e:
-    P(f"[lds_v2] compilation failed: {e}")
+    P(f"[vec_lds] compilation failed: {e}")
 
 _aiter_quant = None
 
@@ -186,7 +200,7 @@ def custom_kernel(data: input_t) -> output_t:
                 sc.contiguous(), b_scale_raw.view(torch.uint8).contiguous(),
                 m, n, k)
         except Exception as e:
-            P(f"[lds_v2] error: {e}")
+            P(f"[vec_lds] error: {e}")
 
     from aiter.ops.triton.gemm.basic.gemm_afp4wfp4 import gemm_afp4wfp4
     return gemm_afp4wfp4(fp4, B_q.view(torch.uint8), sc, b_scale_raw, dtype=torch.bfloat16)
